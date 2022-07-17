@@ -1,3 +1,2 @@
-# Overlay OSS
-
-所有设计基于 B站的 BOSS 公众号文章公布的细节
+# boss
+A s3-compatible oss writen under bilibili's blog

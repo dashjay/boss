@@ -17,7 +17,7 @@ type ListQuery struct {
 type MultipartQuery struct {
 	Uploads        bool
 	UploadId       string
-	PartNumber     int
+	PartNumber     int64
 	MaxParts       int64
 	Marker         int64
 	KeyMarker      string

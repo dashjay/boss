@@ -236,7 +236,7 @@ func (a *S3Proxy) listBuckets(input *s3.ListBucketsInput) (*s3.ListBucketsOutput
 }
 
 func (a *S3Proxy) ServeHTTP(wr http.ResponseWriter, r *http.Request) {
-	query := parse.ParseS3Query(r)
+	query := parse.S3Query(r)
 	a.ServeMux(query.Type)(query, wr, r)
 }
 

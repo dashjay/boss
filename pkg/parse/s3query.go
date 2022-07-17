@@ -1,7 +1,6 @@
 package parse
 
 import (
-	"encoding/xml"
 	"github.com/dashjay/overlay_oss/pkg/types"
 	log "github.com/sirupsen/logrus"
 	"net/http"
@@ -9,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 )
-
 
 var (
 	multipartRelatedOp = map[types.S3Operation]bool{
@@ -25,108 +23,112 @@ func IsMultipartRelatedOp(op types.S3Operation) bool {
 	return isRelated
 }
 
-func anyInQuery(query url.Values, keys ...string) bool {
-	for _, key := range keys {
-		_, ok := query[key]
-		if ok {
-			return true
-		}
-	}
-	return false
-}
+const (
+	Delimiter         = "delimiter"
+	Prefix            = "prefix"
+	Marker            = "marker"
+	KeyMarker         = "key-marker"
+	VersionIdMarker   = "version-id-marker"
+	ListType          = "list-type"
+	ListTypeV2        = "2"
+	StartAfter        = "start-after"
+	ContinuationToken = "continuation-token"
+	PartNumber        = "part-number"
+	PartNumberMarker  = "part-number-marker"
+	MaxUploads        = "max-uploads"
+	MaxKeys           = "max-keys"
+	MaxParts          = "max-parts"
+	Uploads           = "uploads"
+	UploadId          = "uploadId"
+	UploadIdMarker    = "upload-id-marker"
+	Delete            = "delete"
 
-// Copy from https://github.com/minio/minio/blob/master/cmd/handler-utils.go
-func path2BucketAndObject(path string) (bucket, object string) {
-	// Skip the first element if it is '/', split the rest.
-	path = strings.TrimPrefix(path, "/")
-	pathComponents := strings.SplitN(path, "/", 2)
-	// Save the bucket and object extracted from path.
-	switch len(pathComponents) {
-	case 1:
-		bucket = pathComponents[0]
-	case 2:
-		bucket = pathComponents[0]
-		object = pathComponents[1]
+	// Did not implement
+	Acl        = "acl"
+	Lifecycle  = "lifecycle"
+	Policy     = "policy"
+	Tagging    = "tagging"
+	Versioning = "versioning"
+)
+
+func S3Query(r *http.Request) (q types.S3Query) {
+	// path2BucketAndObject Copy from https://github.com/minio/minio/blob/master/cmd/handler-utils.go
+	path2BucketAndObject := func(path string) (bucket, object string) {
+		// Skip the first element if it is '/', split the rest.
+		path = strings.TrimPrefix(path, "/")
+		pathComponents := strings.SplitN(path, "/", 2)
+		// Save the bucket and object extracted from path.
+		switch len(pathComponents) {
+		case 1:
+			bucket = pathComponents[0]
+		case 2:
+			bucket = pathComponents[0]
+			object = pathComponents[1]
+		}
+		return bucket, object
 	}
-	return bucket, object
-}
-func ParseS3Query(r *http.Request) (q types.S3Query) {
-	log.Debugln(r.Method, r.URL)
-	log.Debugln(r.Header)
 	bucket, object := path2BucketAndObject(r.URL.Path)
 	query := r.URL.Query()
+	parseIntFromQuery := func(key string, into *int64, defalt int64) {
+		v := query.Get(key)
+		if v == "" {
+			*into = defalt
+			return
+		}
+		k, err := strconv.ParseInt(v, 10, 32)
+		if err != nil {
+			*into = defalt
+			log.WithError(err).WithField(key, v).Warn("Parse failed")
+			return
+		}
+		*into = k
+	}
+	inQuery := func(key string) bool {
+		_, ok := query[key]
+		return ok
+	}
+
+	anyInQuery := func(keys ...string) bool {
+		for _, key := range keys {
+			_, ok := query[key]
+			if ok {
+				return true
+			}
+		}
+		return false
+	}
+
 	q.ListQuery.Version = 1
-	q.ListQuery.Delimiter = query.Get("delimiter")
-	q.ListQuery.Prefix = query.Get("prefix")
-	q.ListQuery.Marker = query.Get("marker")
-	q.ListQuery.KeyMarker = query.Get("key-marker")
-	q.ListQuery.VersionIdMarker = query.Get("version-id-marker")
-	if query.Get("list-type") == "2" {
+	q.ListQuery.Delimiter, q.ListQuery.Prefix, q.ListQuery.Marker, q.ListQuery.KeyMarker, q.ListQuery.VersionIdMarker =
+		query.Get(Delimiter), query.Get(Prefix), query.Get(Marker), query.Get(KeyMarker), query.Get(VersionIdMarker)
+
+	if query.Get(ListType) == ListTypeV2 {
 		q.ListQuery.Version = 2
-		startAfter := query.Get("start-after")
-		token := query.Get("continuation-token")
-		if token == "" {
-			q.ListQuery.Marker = startAfter
-		} else {
+
+		q.ListQuery.Marker = query.Get(StartAfter)
+		if token := query.Get(ContinuationToken); token != "" {
 			q.ListQuery.Marker = token
 		}
 	}
 	q.ListQuery.MaxKeys = 1000
-	if v := query.Get("max-keys"); v != "" {
-		k, err := strconv.ParseInt(v, 10, 32)
-		if err != nil {
-			log.WithError(err).WithField("maxkeys", v).Warn("Parse maxkeys failed")
-		} else {
-			q.ListQuery.MaxKeys = int64(k)
-		}
-	}
-	if _, ok := query["uploads"]; ok {
-		q.MpQuery.Uploads = true
-	}
-	q.MpQuery.UploadId = query.Get("uploadId")
-	q.MpQuery.KeyMarker = query.Get("key-marker")
-	q.MpQuery.UploadIdMarker = query.Get("upload-id-marker")
-	q.MpQuery.MaxUploads = 1000
-	q.MpQuery.MaxParts = 1000
-	if v := query.Get("max-uploads"); v != "" {
-		k, err := strconv.ParseInt(v, 10, 32)
-		if err != nil {
-			log.WithError(err).WithField("maxuploads", v).Warn("Parse maxuploads failed")
-		} else {
-			q.MpQuery.MaxUploads = int64(k)
-		}
-	}
-	if v := query.Get("part-number-marker"); v != "" {
-		k, err := strconv.ParseInt(v, 10, 32)
-		if err != nil {
-			log.WithError(err).WithField("part-number-marker", v).Warn("Parse part-number-marker failed")
-		} else {
-			q.MpQuery.Marker = int64(k)
-		}
-	}
-	if v := query.Get("partNumber"); v != "" {
-		k, err := strconv.ParseInt(v, 10, 32)
-		if err != nil {
-			log.WithError(err).WithField("partNumber", v).Warn("Parse partNumber failed")
-		} else {
-			q.MpQuery.PartNumber = int(k)
-		}
-	}
-	if v := query.Get("max-parts"); v != "" {
-		k, err := strconv.ParseInt(v, 10, 32)
-		if err != nil {
-			log.WithError(err).WithField("max-parts", v).Warn("Parse max-parts failed")
-		} else {
-			q.MpQuery.MaxParts = int64(k)
-		}
-	}
+	parseIntFromQuery(MaxKeys, &q.ListQuery.MaxKeys, 1000)
+
+	q.MpQuery.Uploads = inQuery(Uploads)
+
+	q.MpQuery.UploadId, q.MpQuery.KeyMarker, q.MpQuery.UploadIdMarker =
+		query.Get(UploadId), query.Get(KeyMarker), query.Get(UploadIdMarker)
+
+	parseIntFromQuery(MaxUploads, &q.MpQuery.MaxUploads, 1000)
+	parseIntFromQuery(PartNumberMarker, &q.MpQuery.Marker, 1000)
+	parseIntFromQuery(PartNumber, &q.MpQuery.PartNumber, 0)
+
+	parseIntFromQuery(MaxParts, &q.MpQuery.MaxParts, 0)
+
 	// Check for batch delete.
-	if _, ok := query["delete"]; ok {
-		log.Debug("delete flag detected")
-		q.BatchDelQuery = true
-	}
+	q.BatchDelQuery = inQuery(Delete)
+
 	q.DstObj.Bucket = bucket
-	if anyInQuery(query, "acl", "lifecycle", "policy", "tagging", "versioning") {
+	if anyInQuery(Acl, Lifecycle, Policy, Tagging, Versioning) {
 		q.Type = types.NotImplementOperation
 		return
 	}
@@ -226,18 +228,4 @@ func ParseS3Query(r *http.Request) (q types.S3Query) {
 		q.Type = types.NotImplementOperation
 		return
 	}
-}
-func IsValidKey(key string) bool {
-	bs, err := xml.Marshal(&key)
-	if err != nil {
-		log.WithError(err).WithField("key", key).Warn("Marshal key failed")
-		return false
-	}
-	var reKey string
-	err = xml.Unmarshal(bs, &reKey)
-	if err != nil {
-		log.WithError(err).WithField("key", key).WithField("bytes", bs).Warn("Unmarshal key failed")
-		return false
-	}
-	return key == reKey
 }
