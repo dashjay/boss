@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -51,12 +52,13 @@ func NewS3Proxy() *S3Proxy {
 	logrus.Infoln("migrated")
 	s3proxy := S3Proxy{DB: db}
 	s3proxy.mux = map[types.S3Operation]func(s3query types.S3Query, wr http.ResponseWriter, r *http.Request){
-		types.PutBucket:   s3proxy.CreateBucket,
-		types.PutObject:   s3proxy.PutObject,
-		types.HeadObject:  s3proxy.HeadObject,
-		types.GetObject:   s3proxy.GetObject,
-		types.GetBucket:   s3proxy.GetBucket,
-		types.ListBuckets: s3proxy.ListBuckets,
+		types.PutBucket:    s3proxy.CreateBucket,
+		types.PutObject:    s3proxy.PutObject,
+		types.HeadObject:   s3proxy.HeadObject,
+		types.GetObject:    s3proxy.GetObject,
+		types.GetBucket:    s3proxy.GetBucket,
+		types.ListBuckets:  s3proxy.ListBuckets,
+		types.RemoveObject: s3proxy.DeleteObject,
 	}
 	return &s3proxy
 }
@@ -171,7 +173,11 @@ func (a *S3Proxy) getObject(input *s3.GetObjectInput) (*s3.GetObjectOutput, erro
 }
 
 func (a *S3Proxy) GetBucket(s3query types.S3Query, wr http.ResponseWriter, r *http.Request) {
-	out, err := a.getBucket(&s3.ListObjectsV2Input{Bucket: aws.String(s3query.DstObj.Bucket)})
+	out, err := a.getBucket(&s3.ListObjectsV2Input{
+		Bucket:    aws.String(s3query.DstObj.Bucket),
+		Prefix:    aws.String(s3query.ListQuery.Prefix),
+		Delimiter: aws.String(s3query.ListQuery.Delimiter),
+	})
 	if err != nil {
 		s3error.WriteError(r, wr, err)
 		return
@@ -185,15 +191,32 @@ func (a *S3Proxy) GetBucket(s3query types.S3Query, wr http.ResponseWriter, r *ht
 }
 func (a *S3Proxy) getBucket(input *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, error) {
 	var objects []Object
-	a.DB.Find(&objects, "bucket_name = ?", aws.ToString(input.Bucket))
-	out := &s3.ListObjectsV2Output{Contents: make([]s3types.Object, len(objects))}
+	a.DB.Find(&objects, "bucket_name = ? AND key_prefix like ?", aws.ToString(input.Bucket), aws.ToString(input.Prefix)+"%")
+	stored := make(map[string]struct{}, 0)
+	out := &s3.ListObjectsV2Output{Contents: make([]s3types.Object, 0)}
 	for i := range objects {
-		out.Contents[i] = s3types.Object{
-			Key:          aws.String(objects[i].KeyPrefix),
-			LastModified: &objects[i].UpdatedAt,
-			Size:         int64(len(objects[i].Data)),
+		suffix := strings.TrimPrefix(objects[i].KeyPrefix, aws.ToString(input.Prefix))
+		// is a file
+		if !strings.Contains(suffix, "/") {
+			out.Contents = append(out.Contents, s3types.Object{
+				Key:          aws.String(objects[i].KeyPrefix),
+				LastModified: &objects[i].UpdatedAt,
+				Size:         int64(len(objects[i].Data)),
+				StorageClass: "STANDARD",
+			})
+			out.KeyCount += 1
+		} else if suffix == "" {
+		} else {
+			// is a dir
+			subPrefix := suffix[:strings.Index(suffix, "/")]
+			if _, exists := stored[subPrefix]; !exists {
+				out.Contents = append(out.Contents, s3types.Object{Key: aws.String(subPrefix), LastModified: aws.Time(time.Unix(0, 0))})
+				stored[subPrefix] = struct{}{}
+				out.KeyCount += 1
+			}
 		}
 	}
+	out.Name = input.Bucket
 	return out, nil
 }
 
@@ -235,15 +258,38 @@ func (a *S3Proxy) listBuckets(input *s3.ListBucketsInput) (*s3.ListBucketsOutput
 	}, nil
 }
 
+func (a *S3Proxy) DeleteObject(s3query types.S3Query, wr http.ResponseWriter, r *http.Request) {
+	_, err := a.deleteObject(&s3.DeleteObjectInput{
+		Bucket: aws.String(s3query.DstObj.Bucket),
+		Key:    aws.String(s3query.DstObj.Key),
+	})
+	if err != nil {
+		s3error.WriteError(r, wr, err)
+		return
+	}
+}
+func (a *S3Proxy) deleteObject(input *s3.DeleteObjectInput) (*s3.DeleteObjectOutput, error) {
+	var out Object
+	res := a.DB.First(&out, "bucket_name = ? AND key_prefix = ?", aws.ToString(input.Bucket), aws.ToString(input.Key))
+	if err := res.Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, s3error.S3Error{OriginError: err, Code: s3error.ErrorCodeNoSuchKey}
+		}
+		return nil, err
+	}
+	a.DB.Delete(&out)
+	return &s3.DeleteObjectOutput{}, nil
+}
+
 func (a *S3Proxy) ServeHTTP(wr http.ResponseWriter, r *http.Request) {
 	query := parse.S3Query(r)
+	logrus.Infof("query: %#v\n", query)
 	a.ServeMux(query.Type)(query, wr, r)
 }
 
 var _ http.Handler = (*S3Proxy)(nil)
 
 func (a *S3Proxy) ServeMux(s3Op types.S3Operation) func(s3query types.S3Query, wr http.ResponseWriter, r *http.Request) {
-	logrus.Infoln("s3Op: ", s3Op.String())
 	if handler, ok := a.mux[s3Op]; ok {
 		return handler
 	}
